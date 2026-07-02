@@ -1,65 +1,65 @@
 """Stage 7 + Recommendation Stage 2: Gemini LLM abstraction (DDD 6, 7, 9).
-
+ 
 Exactly two LLM calls per analysis are made through this module:
   1. extract_skills()   - skill extraction, categorization & leveling (temp 0.1)
   2. rerank_courses()   - personalized course re-ranking (temp 0.2)
-
+ 
 Both use the exact prompt templates from DDD Section 7. Responses are parsed as
 strict JSON with a single stricter-prompt retry and a regex-extraction fallback.
 Rate limits (429) are retried with exponential backoff (1s, 2s, 4s; max 3).
 """
 from __future__ import annotations
-
+ 
 import json
 import logging
 import re
 import time
 from typing import Any, Dict, List, Optional
-
+ 
 from app.config import get_settings
 from app.constants.categories import VALID_CATEGORIES
-
+ 
 logger = logging.getLogger(__name__)
-
+ 
 MAX_BACKOFF_RETRIES = 3
 BACKOFF_SCHEDULE = [1, 2, 4]  # seconds
 FALLBACK_CATEGORY = "soft_skills"
-
-
+ 
+ 
 # ---------------------------------------------------------------------------
 # Typed errors (mapped to HTTP codes at the route layer)
 # ---------------------------------------------------------------------------
 class LLMError(Exception):
     pass
-
-
+ 
+ 
 class LLMRateLimitError(LLMError):
     """Rate limit exhausted after retries -> 429."""
-
-
+ 
+ 
 class LLMTimeoutError(LLMError):
     """Timed out after a retry -> 504."""
-
-
+ 
+ 
 class LLMConfigError(LLMError):
     """Invalid API key / auth -> 500 configuration error."""
-
-
+ 
+ 
 class LLMContentBlockedError(LLMError):
     """Safety filter blocked the content -> 422."""
-
-
+ 
+ 
 class LLMParseError(LLMError):
     """Could not parse JSON even after retry + regex fallback."""
-
-
+ 
+ 
 # ---------------------------------------------------------------------------
 # Prompt templates (DDD Section 7) — verbatim
 # ---------------------------------------------------------------------------
 EXTRACTION_SYSTEM_PROMPT = """You are an expert HR technology analyst specializing in skill assessment
 and competency mapping. Your task is to analyze resume content and extract
 a structured skills profile with categorization.
-
+ 
 RULES:
 1. ONLY identify skills that have explicit evidence in the resume text.
 2. Standardize skill names to match the organization's required skills
@@ -79,7 +79,7 @@ RULES:
 6. Include a brief evidence snippet (max 50 words) from the resume.
 7. If a required skill has NO evidence, DO NOT include it.
 8. You MAY identify additional skills beyond the required list.
-
+ 
 Respond with ONLY a valid JSON array. No markdown, no preamble.
 [
   {{
@@ -90,27 +90,27 @@ Respond with ONLY a valid JSON array. No markdown, no preamble.
     "evidence_snippet": "5 years Python, built Django REST APIs"
   }}
 ]"""
-
+ 
 EXTRACTION_USER_PROMPT = """## RESUME CONTENT (retrieved chunks)
 {resume_context}
-
+ 
 ## ROLE REQUIREMENTS
 Role: {role_name}
 Required Skills:
 {role_skills_json}
-
+ 
 ## VALID SKILL CATEGORIES
 {valid_categories_json}
-
+ 
 Analyze the resume content above. Extract all identifiable skills,
 standardize names to match required skills where applicable,
 estimate levels (1-4), assign a category from the valid list,
 and provide evidence. Return ONLY a JSON array."""
-
+ 
 RERANK_SYSTEM_PROMPT = """You are an intelligent learning advisor. Given an employee's skill gaps
 and a list of candidate courses, rank and filter courses to create a
 personalized learning path.
-
+ 
 RULES:
 1. For each gap, select the top 3-5 most relevant courses.
 2. Rank by APPROPRIATENESS to employee's current level:
@@ -122,7 +122,7 @@ RULES:
 5. Provide brief reasoning (1-2 sentences) per recommendation.
 6. Assign relevance_score (0.0-1.0) for each course.
 7. Group recommendations by skill gap.
-
+ 
 Respond with ONLY a valid JSON array. No markdown, no explanation.
 [
   {{
@@ -139,26 +139,26 @@ Respond with ONLY a valid JSON array. No markdown, no explanation.
     ]
   }}
 ]"""
-
+ 
 RERANK_USER_PROMPT = """## EMPLOYEE SKILL GAPS
 {gaps_json}
-
+ 
 ## CANDIDATE COURSES (retrieved via semantic search)
 {candidate_courses_json}
-
+ 
 ## CONTEXT
 Employee: {employee_name}
 Target Role: {role_name}
-
+ 
 Select and rank the best courses for each gap. Return ONLY JSON."""
-
+ 
 STRICTER_SUFFIX = (
     "\n\nIMPORTANT: Your previous response was not valid JSON. "
     "Respond with ONLY a raw JSON array. Do not include markdown code fences, "
     "comments, or any text before or after the JSON."
 )
-
-
+ 
+ 
 # ---------------------------------------------------------------------------
 # Low-level Gemini call with backoff
 # ---------------------------------------------------------------------------
@@ -167,10 +167,10 @@ def _configure() -> None:
     if not settings.gemini_api_key or settings.gemini_api_key == "your-gemini-api-key-here":
         raise LLMConfigError("GEMINI_API_KEY is not configured")
     import google.generativeai as genai
-
+ 
     genai.configure(api_key=settings.gemini_api_key)
-
-
+ 
+ 
 def _call_gemini(
     system_prompt: str,
     user_prompt: str,
@@ -182,7 +182,7 @@ def _call_gemini(
     _configure()
     import google.generativeai as genai
     from google.api_core import exceptions as gexc
-
+ 
     settings = get_settings()
     model = genai.GenerativeModel(
         model_name=settings.gemini_model,
@@ -193,7 +193,8 @@ def _call_gemini(
             "response_mime_type": "application/json",
         },
     )
-
+ 
+    logger.info("Calling Gemini model '%s' (temp=%s)", settings.gemini_model, temperature)
     attempt = 0
     timed_out_once = False
     while True:
@@ -215,30 +216,40 @@ def _call_gemini(
             timed_out_once = True
             logger.warning("Gemini timeout; retrying once")
         except (gexc.Unauthenticated, gexc.PermissionDenied) as exc:
-            raise LLMConfigError("Configuration error - contact admin") from exc
-
-
+            logger.error("Gemini auth/permission error: %r", exc)
+            raise LLMConfigError(f"Gemini auth error: {exc}") from exc
+        except (gexc.InvalidArgument, gexc.NotFound) as exc:
+            # Bad model name, unsupported generation_config, etc.
+            logger.error("Gemini invalid request (model='%s'): %r", settings.gemini_model, exc)
+            raise LLMConfigError(f"Gemini invalid request: {exc}") from exc
+        except LLMError:
+            raise
+        except Exception as exc:  # surface anything else with detail
+            logger.exception("Unexpected Gemini call failure")
+            raise LLMError(f"Gemini call failed: {exc}") from exc
+ 
+ 
 def _extract_response_text(response: Any) -> str:
     """Extract text, raising typed errors on safety blocks / empty output."""
     # Prompt-level block.
     feedback = getattr(response, "prompt_feedback", None)
     if feedback is not None and getattr(feedback, "block_reason", None):
         raise LLMContentBlockedError("Resume flagged by safety filter")
-
+ 
     candidates = getattr(response, "candidates", None) or []
     if candidates:
         finish_reason = getattr(candidates[0], "finish_reason", None)
         # finish_reason == 3 (SAFETY) in the protobuf enum.
         if finish_reason == 3:
             raise LLMContentBlockedError("Resume flagged by safety filter")
-
+ 
     try:
         text = response.text or ""
     except Exception:  # pragma: no cover - blocked/empty candidate access
         text = ""
     return text.strip()
-
-
+ 
+ 
 # ---------------------------------------------------------------------------
 # JSON parsing helpers
 # ---------------------------------------------------------------------------
@@ -248,8 +259,27 @@ def _strip_code_fences(text: str) -> str:
         text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
         text = re.sub(r"\n?```$", "", text)
     return text.strip()
-
-
+ 
+ 
+def _coerce_to_list(parsed: Any) -> Optional[List[Any]]:
+    """Coerce a parsed JSON value into a list of records.
+ 
+    Accepts a top-level array, an object wrapping an array (e.g.
+    {"skills": [...]}), or a single record object (wrapped into a list).
+    """
+    if isinstance(parsed, list):
+        return parsed
+    if isinstance(parsed, dict):
+        # An object whose value is the array we want.
+        for value in parsed.values():
+            if isinstance(value, list):
+                return value
+        # A single record object -> wrap it.
+        if parsed:
+            return [parsed]
+    return None
+ 
+ 
 def _regex_extract_json_array(text: str) -> Optional[Any]:
     """Last-resort: grab the outermost [...] block and try to parse it."""
     match = re.search(r"\[.*\]", text, re.DOTALL)
@@ -259,20 +289,77 @@ def _regex_extract_json_array(text: str) -> Optional[Any]:
         return json.loads(match.group(0))
     except json.JSONDecodeError:
         return None
-
-
+ 
+ 
+def _repair_truncated_array(text: str) -> Optional[List[Any]]:
+    """Repair a JSON array that was cut off mid-stream (MAX_TOKENS).
+ 
+    Finds the array start, keeps every complete top-level object, and closes
+    the array. Returns whatever complete records were recovered.
+    """
+    start = text.find("[")
+    if start == -1:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    last_complete = -1  # index just after the last balanced top-level object
+    for i in range(start + 1, len(text)):
+        ch = text[i]
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                last_complete = i + 1
+    if last_complete == -1:
+        return None
+    candidate = text[start:last_complete] + "]"
+    try:
+        parsed = json.loads(candidate)
+        return parsed if isinstance(parsed, list) else None
+    except json.JSONDecodeError:
+        return None
+ 
+ 
 def _parse_json_array(text: str) -> Optional[List[Any]]:
     if not text:
         return None
     cleaned = _strip_code_fences(text)
+ 
+    # 1. Direct parse (accept arrays, wrapped arrays, or single objects).
     try:
-        parsed = json.loads(cleaned)
-        return parsed if isinstance(parsed, list) else None
+        coerced = _coerce_to_list(json.loads(cleaned))
+        if coerced is not None:
+            return coerced
     except json.JSONDecodeError:
-        extracted = _regex_extract_json_array(cleaned)
-        return extracted if isinstance(extracted, list) else None
-
-
+        pass
+ 
+    # 2. Regex-extract an embedded array.
+    extracted = _regex_extract_json_array(cleaned)
+    if isinstance(extracted, list):
+        return extracted
+ 
+    # 3. Repair a truncated array (recover complete records).
+    repaired = _repair_truncated_array(cleaned)
+    if repaired is not None:
+        logger.warning("Recovered %d records from a truncated JSON array", len(repaired))
+        return repaired
+ 
+    return None
+ 
+ 
 # ---------------------------------------------------------------------------
 # Public API - LLM Call 1: skill extraction
 # ---------------------------------------------------------------------------
@@ -290,26 +377,32 @@ def extract_skills(
         role_skills_json=role_skills_json,
         valid_categories_json=valid_categories_json,
     )
-
-    text = _call_gemini(system, user, temperature=0.1, max_output_tokens=2048, timeout=30)
+ 
+    text = _call_gemini(system, user, temperature=0.1, max_output_tokens=8192, timeout=30)
     parsed = _parse_json_array(text)
-
+ 
     if parsed is None:
         # Retry once with a stricter instruction (DDD 6 Stage 7).
-        logger.warning("Extraction JSON parse failed; retrying with stricter prompt")
+        logger.warning(
+            "Extraction JSON parse failed; retrying with stricter prompt. Raw (first 800 chars): %s",
+            (text or "")[:800],
+        )
         text = _call_gemini(
-            system, user + STRICTER_SUFFIX, temperature=0.0, max_output_tokens=2048, timeout=30
+            system, user + STRICTER_SUFFIX, temperature=0.0, max_output_tokens=8192, timeout=30
         )
         parsed = _parse_json_array(text)
-
+ 
     if parsed is None:
         # Empty response edge case -> return empty list rather than crash (DDD 12.2).
-        logger.error("Extraction returned unparseable output; returning empty skill list")
+        logger.error(
+            "Extraction returned unparseable output; returning empty skill list. Raw (first 800 chars): %s",
+            (text or "")[:800],
+        )
         return []
-
+ 
     return _sanitize_extracted_skills(parsed)
-
-
+ 
+ 
 def _sanitize_extracted_skills(raw: List[Any]) -> List[Dict[str, Any]]:
     """Validate/normalize extracted skills; fallback category to soft_skills."""
     out: List[Dict[str, Any]] = []
@@ -343,8 +436,8 @@ def _sanitize_extracted_skills(raw: List[Any]) -> List[Dict[str, Any]]:
             }
         )
     return out
-
-
+ 
+ 
 # ---------------------------------------------------------------------------
 # Public API - LLM Call 2: course re-ranking
 # ---------------------------------------------------------------------------
@@ -361,12 +454,12 @@ def rerank_courses(
         employee_name=employee_name or "N/A",
         role_name=role_name,
     )
-
+ 
     text = _call_gemini(
         RERANK_SYSTEM_PROMPT, user, temperature=0.2, max_output_tokens=4096, timeout=45
     )
     parsed = _parse_json_array(text)
-
+ 
     if parsed is None:
         logger.warning("Re-ranking JSON parse failed; retrying with stricter prompt")
         text = _call_gemini(
@@ -377,9 +470,9 @@ def rerank_courses(
             timeout=45,
         )
         parsed = _parse_json_array(text)
-
+ 
     if parsed is None:
         logger.error("Re-ranking returned unparseable output; returning empty recommendations")
         return []
-
+ 
     return [item for item in parsed if isinstance(item, dict)]
