@@ -5,7 +5,7 @@ import ResumeUpload from "../components/employee/ResumeUpload";
 import AnalysisResults from "../components/employee/AnalysisResults";
 import LoadingSpinner from "../components/shared/LoadingSpinner";
 import { listEmployeeRoles, analyzeResume } from "../services/api";
-
+ 
 const PIPELINE_STEPS = [
   "Parsing resume",
   "Chunking & embedding",
@@ -15,21 +15,34 @@ const PIPELINE_STEPS = [
   "Gap comparison",
   "Course retrieval & re-ranking",
 ];
-
+ 
+// Rotating, human-friendly status lines shown while the pipeline runs.
+const STATUS_MESSAGES = [
+  "Reading your resume",
+  "Extracting your experience and projects",
+  "Understanding the skills you've demonstrated",
+  "Matching your profile against the target role",
+  "Estimating your proficiency levels",
+  "Identifying skill gaps",
+  "Searching thousands of courses",
+  "Curating a personalized learning path",
+  "Finalizing your readiness report",
+];
+ 
 export default function EmployeePage() {
   const [roles, setRoles] = useState([]);
   const [rolesLoading, setRolesLoading] = useState(true);
   const [rolesError, setRolesError] = useState(null);
-
+ 
   const [roleSlug, setRoleSlug] = useState("");
   const [employeeName, setEmployeeName] = useState("");
   const [file, setFile] = useState(null);
   const [fileError, setFileError] = useState(null);
-
+ 
   const [phase, setPhase] = useState("form"); // form | analyzing | results
   const [error, setError] = useState(null);
   const [result, setResult] = useState(null);
-
+ 
   useEffect(() => {
     let active = true;
     (async () => {
@@ -46,9 +59,9 @@ export default function EmployeePage() {
       active = false;
     };
   }, []);
-
+ 
   const canSubmit = roleSlug && file && !fileError;
-
+ 
   const handleAnalyze = async () => {
     if (!canSubmit) return;
     setError(null);
@@ -64,14 +77,14 @@ export default function EmployeePage() {
       setPhase("form");
     }
   };
-
+ 
   const reset = () => {
     setResult(null);
     setFile(null);
     setPhase("form");
     setError(null);
   };
-
+ 
   if (phase === "results" && result) {
     return (
       <div className="page">
@@ -79,7 +92,7 @@ export default function EmployeePage() {
       </div>
     );
   }
-
+ 
   if (phase === "analyzing") {
     return (
       <div className="page">
@@ -87,7 +100,7 @@ export default function EmployeePage() {
       </div>
     );
   }
-
+ 
   return (
     <div className="page">
       <div className="page-header">
@@ -96,21 +109,21 @@ export default function EmployeePage() {
           Select a target role and upload your resume to assess role readiness.
         </div>
       </div>
-
+ 
       {rolesError ? (
         <div className="alert alert-danger mb-4">
           <AlertTriangle size={18} />
           <div>{rolesError}</div>
         </div>
       ) : null}
-
+ 
       {error ? (
         <div className="alert alert-danger mb-4">
           <AlertTriangle size={18} />
           <div>{error}</div>
         </div>
       ) : null}
-
+ 
       <div className="card card-body" style={{ maxWidth: 680 }}>
         {rolesLoading ? (
           <LoadingSpinner label="Loading roles..." />
@@ -126,7 +139,7 @@ export default function EmployeePage() {
             <div className="field">
               <RoleSelector roles={roles} value={roleSlug} onChange={setRoleSlug} />
             </div>
-
+ 
             <div className="field">
               <label className="label">Your Name</label>
               <input
@@ -136,21 +149,21 @@ export default function EmployeePage() {
                 onChange={(e) => setEmployeeName(e.target.value)}
               />
             </div>
-
+ 
             <ResumeUpload
               file={file}
               onFileSelect={setFile}
               onClear={() => setFile(null)}
               onError={setFileError}
             />
-
+ 
             {fileError ? (
               <div className="alert alert-danger mt-4">
                 <AlertTriangle size={18} />
                 <div>{fileError}</div>
               </div>
             ) : null}
-
+ 
             <button
               className="btn btn-primary btn-block mt-6"
               disabled={!canSubmit}
@@ -164,29 +177,52 @@ export default function EmployeePage() {
     </div>
   );
 }
-
+ 
 function AnalyzingView() {
   const [activeStep, setActiveStep] = useState(0);
-  const timer = useRef(null);
-
+  const [msgIndex, setMsgIndex] = useState(0);
+  const [dots, setDots] = useState("");
+  const stepTimer = useRef(null);
+  const msgTimer = useRef(null);
+  const dotTimer = useRef(null);
+ 
   useEffect(() => {
     // Cosmetic progression through pipeline stages while the request runs.
-    timer.current = window.setInterval(() => {
+    stepTimer.current = window.setInterval(() => {
       setActiveStep((s) => Math.min(s + 1, PIPELINE_STEPS.length - 1));
-    }, 2200);
-    return () => window.clearInterval(timer.current);
+    }, 3000);
+    // Rotating human-friendly status message.
+    msgTimer.current = window.setInterval(() => {
+      setMsgIndex((m) => (m + 1) % STATUS_MESSAGES.length);
+    }, 2400);
+    // Animated trailing dots (Claude-style "working" indicator).
+    dotTimer.current = window.setInterval(() => {
+      setDots((d) => (d.length >= 3 ? "" : d + "."));
+    }, 400);
+    return () => {
+      window.clearInterval(stepTimer.current);
+      window.clearInterval(msgTimer.current);
+      window.clearInterval(dotTimer.current);
+    };
   }, []);
-
+ 
   return (
-    <div className="card card-body" style={{ maxWidth: 560, margin: "40px auto" }}>
+    <div className="card card-body" style={{ maxWidth: 620, margin: "40px auto" }}>
       <div className="center-col mb-4">
         <span className="spinner lg" />
-        <div className="font-semibold">Analyzing resume</div>
+        <div className="analyze-status" aria-live="polite">
+          <span className="analyze-status-text">{STATUS_MESSAGES[msgIndex]}</span>
+          <span className="analyze-dots">{dots}</span>
+        </div>
         <div className="text-sm text-muted">
-          Running the 7-stage pipeline. This can take up to 2 minutes.
+          Working through the analysis pipeline. This can take a few minutes.
         </div>
       </div>
-
+ 
+      <div className="analyze-progress mb-4">
+        <div className="analyze-progress-bar" />
+      </div>
+ 
       <div className="steps">
         {PIPELINE_STEPS.map((label, i) => {
           const done = i < activeStep;
@@ -213,3 +249,5 @@ function AnalyzingView() {
     </div>
   );
 }
+ 
+ 
